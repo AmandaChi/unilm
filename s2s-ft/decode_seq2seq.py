@@ -16,7 +16,8 @@ import random
 import pickle
 
 from transformers import BertTokenizer, RobertaTokenizer
-from s2s_ft.modeling_decoding import BertForSeq2SeqDecoder, BertConfig
+from s2s_ft.modeling_decoding_fast import BertForSeq2SeqDecoderFast, BertConfig
+from s2s_ft.modeling_decoding import BertForSeq2SeqDecoder
 from transformers.tokenization_bert import whitespace_tokenize
 import s2s_ft.s2s_loader as seq2seq_loader
 from s2s_ft.utils import load_and_cache_examples
@@ -121,7 +122,8 @@ def main():
                         help="Using position shift for fine-tuning.")
     parser.add_argument("--cache_dir", default=None, type=str,
                         help="Where do you want to store the pre-trained models downloaded from s3")
-
+    parser.add_argument("--fast", action='store_true',
+                        help="Whether to enable fast decoding")
     args = parser.parse_args()
 
     if args.need_score_traces and args.beam_size <= 1:
@@ -152,13 +154,12 @@ def main():
     tokenizer = TOKENIZER_CLASSES[args.model_type].from_pretrained(
         args.tokenizer_name, do_lower_case=args.do_lower_case, 
         cache_dir=args.cache_dir if args.cache_dir else None)
-
     if args.model_type == "roberta":
         vocab = tokenizer.encoder
     else:
         vocab = tokenizer.vocab
 
-    tokenizer.max_len = args.max_seq_length
+    #tokenizer.max_len = args.max_seq_length
 
     config_file = args.config_path if args.config_path else os.path.join(args.model_path, "config.json")
     logger.info("Read decoding config from: %s" % config_file)
@@ -171,8 +172,8 @@ def main():
         source_type_id=config.source_type_id, target_type_id=config.target_type_id, 
         cls_token=tokenizer.cls_token, sep_token=tokenizer.sep_token, pad_token=tokenizer.pad_token))
 
-    mask_word_id, eos_word_ids, sos_word_id = tokenizer.convert_tokens_to_ids(
-        [tokenizer.mask_token, tokenizer.sep_token, tokenizer.sep_token])
+    mask_word_id, eos_word_ids, sos_word_id, pad_word_id = tokenizer.convert_tokens_to_ids(
+        [tokenizer.mask_token, tokenizer.sep_token, tokenizer.sep_token,tokenizer.pad_token])
     forbid_ignore_set = None
     if args.forbid_ignore_word:
         w_list = []
@@ -187,13 +188,22 @@ def main():
     for model_recover_path in [args.model_path.strip()]:
         logger.info("***** Recover model: %s *****", model_recover_path)
         found_checkpoint_flag = True
-        model = BertForSeq2SeqDecoder.from_pretrained(
-            model_recover_path, config=config, mask_word_id=mask_word_id, search_beam_size=args.beam_size,
-            length_penalty=args.length_penalty, eos_id=eos_word_ids, sos_id=sos_word_id,
-            forbid_duplicate_ngrams=args.forbid_duplicate_ngrams, forbid_ignore_set=forbid_ignore_set,
-            ngram_size=args.ngram_size, min_len=args.min_len, mode=args.mode,
-            max_position_embeddings=args.max_seq_length, pos_shift=args.pos_shift, 
-        )
+        if args.fast:
+            model = BertForSeq2SeqDecoderFast.from_pretrained(
+                model_recover_path, config=config, mask_word_id=mask_word_id, search_beam_size=args.beam_size,
+                length_penalty=args.length_penalty, eos_id=eos_word_ids, sos_id=sos_word_id,
+                forbid_duplicate_ngrams=args.forbid_duplicate_ngrams, forbid_ignore_set=forbid_ignore_set,
+                ngram_size=args.ngram_size, min_len=args.min_len, mode=args.mode,
+                max_position_embeddings=args.max_seq_length, pos_shift=args.pos_shift, pad_id = pad_word_id, max_len=args.max_tgt_length
+            )
+        else:
+            model = BertForSeq2SeqDecoder.from_pretrained(
+                model_recover_path, config=config, mask_word_id=mask_word_id, search_beam_size=args.beam_size,
+                length_penalty=args.length_penalty, eos_id=eos_word_ids, sos_id=sos_word_id,
+                forbid_duplicate_ngrams=args.forbid_duplicate_ngrams, forbid_ignore_set=forbid_ignore_set,
+                ngram_size=args.ngram_size, min_len=args.min_len, mode=args.mode,
+                max_position_embeddings=args.max_seq_length, pos_shift=args.pos_shift
+            )
 
         if args.fp16:
             model.half()
@@ -243,13 +253,18 @@ def main():
                     batch = [
                         t.to(device) if t is not None else None for t in batch]
                     input_ids, token_type_ids, position_ids, input_mask, mask_qkv, task_idx = batch
-                    traces = model(input_ids, token_type_ids,
+                    if args.fast:
+                        traces = model.beam_search(input_ids, token_type_ids,
                                    position_ids, input_mask, task_idx=task_idx, mask_qkv=mask_qkv)
+                    else:
+                        traces = model(input_ids, token_type_ids,
+                                position_ids, input_mask, task_idx=task_idx, mask_qkv=mask_qkv)
                     if args.beam_size > 1:
                         traces = {k: v.tolist() for k, v in traces.items()}
                         output_ids = traces['pred_seq']
                     else:
                         output_ids = traces.tolist()
+                    #print(output_ids)
                     for i in range(len(buf)):
                         w_ids = output_ids[i]
                         output_buf = tokenizer.convert_ids_to_tokens(w_ids)
