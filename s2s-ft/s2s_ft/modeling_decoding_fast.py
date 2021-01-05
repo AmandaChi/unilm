@@ -281,13 +281,13 @@ class BertForSeq2SeqDecoderFast(BertForSeq2SeqDecoder,GenerationMixin):
     def get_output_embeddings(self):
         return self.cls.predictions.decoder
     def beam_search(self, input_ids,token_type_ids,position_ids,attention_mask,task_idx=None,mask_qkv=None):
-        self.src_state = dict({
-            'src_len': input_ids.size(1),
-            'src_token': input_ids,
-            'src_seg': token_type_ids,
-            'src_mask': attention_mask,
-            'src_pos': position_ids
-        })
+        #self.src_state = dict({
+        #    'src_len': input_ids.size(1),
+        #    'src_token': input_ids,
+        #    'src_seg': token_type_ids,
+        #    'src_mask': attention_mask,
+        #    'src_pos': position_ids
+        #})
         #print(position_ids.size(1))
         #print(input_ids.size(1))
         #print(attention_mask)
@@ -296,25 +296,38 @@ class BertForSeq2SeqDecoderFast(BertForSeq2SeqDecoder,GenerationMixin):
                                    torch.ones([batch_size,position_ids.size(1)-input_ids.size(1)])),-1)
         position_ids = torch.cat((position_ids,position_ids[:,-1:]+1),-1)
         attention_mask[:,:,input_ids.size(1)] = torch.zeros_like(attention_mask[:,:,input_ids.size(1)])
+        attention_mask = torch.cat((attention_mask,torch.zeros_like(attention_mask[:,:,-1:])),-1)
+        attention_mask = torch.cat((attention_mask,attention_mask[:,-1:,:]),1)
+        attention_mask[:,-1,-1] = torch.ones_like(attention_mask[:,-1,-1])
+        #print(attention_mask.cpu().numpy().tolist())
         #print(position_ids)
-        #print(attention_mask)
+        #print(position_ids.size())
+        #print(attention_mask.size())
         dec_seg = [0] + [1] * (self.dec_max_seq_length)
         self.dec_seg = torch.tensor(dec_seg, dtype=torch.long, device=input_ids.device).unsqueeze(0).repeat(input_ids.size(0) * self.search_beam_size, 1)
         self.dec_mask_token = torch.from_numpy(np.array([self.mask_word_id])).repeat([input_ids.size(0) * self.search_beam_size]).unsqueeze(-1).to(input_ids.device)
         bos_token = torch.from_numpy(np.array([self.sos_id])).repeat([batch_size]).unsqueeze(-1)
         if torch.cuda.is_available():
             bos_token = bos_token.cuda()
+        self.src_state = dict({
+            'src_len': input_ids.size(1),
+            'src_token': input_ids,
+            'src_seg': token_type_ids,
+            'src_mask': attention_mask,
+            'src_pos': position_ids
+        })
+        #
 
         batch_hyp = self.generate(
             bos_token,
-            max_length=self.dec_max_seq_length,
+            max_length=self.dec_max_seq_length+1,
             min_length=self.min_len,
             do_sample=False,
             num_beams=self.search_beam_size,
             no_repeat_ngram_size=self.ngram_size,
             length_penalty=self.length_penalty,
             repetition_penalty=1.0, #TODO:#repetition_penalty,
-            bad_words_ids=[[10]],#TODO:self.forbid_duplicate_ngrams,
+            bad_words_ids=[[50]],#TODO:self.forbid_duplicate_ngrams,
             bos_token_id=self.sos_id,
             pad_token_id=self.pad_id,#TODO: self.,
             eos_token_id=self.eos_id,
