@@ -23,6 +23,8 @@ import torch.nn.functional as F
 import fastseq
 from transformers.file_utils import cached_path
 from transformers.generation_utils import GenerationMixin
+#from fastseq.optimizer.transformers.beam_search_optimizer_v2 import GenerationMixinV3
+from fastseq.optimizer.transformers.beam_search_optimizer import GenerationMixinV2
 
 from torch.nn.modules.loss import _Loss
 
@@ -46,6 +48,21 @@ def _reorder_buffer(attn_cache, beam_idx):
     for k, input_buffer_k in attn_cache.items():
         if input_buffer_k is not None and 'enc' not in k:
             attn_cache[k] = input_buffer_k.index_select(0, beam_idx)
+    return attn_cache
+
+def _get_new_tensor(tensor, batch_idx, beam_idx, beam_size):
+    tsz = tensor.size()
+    tensor = tensor.view(-1, beam_size, *tsz[1:])
+    tensor = tensor[batch_idx].view(-1, *tsz[1:])[beam_idx]
+    return tensor
+
+def _reorder_buffer_v2(attn_cache, batch_idx, beam_idx):
+    for k, input_buffer_k in attn_cache.items():
+        if input_buffer_k is not None:
+            if 'enc' in k:
+                attn_cache[k] = input_buffer_k if batch_idx is None else input_buffer_k.index_select(0, batch_idx)
+            else:
+                attn_cache[k] = input_buffer_k if batch_idx is None else input_buffer_k.index_select(0, beam_idx)
     return attn_cache
 
 class BertSelfAttention(nn.Module):
@@ -196,7 +213,7 @@ class BertModel(OriBertModel):
             encoded_layers = encoded_layers[-1]
         return sequence_output,pooled_output, encoded_layers, history_states
 
-class BertForSeq2SeqDecoderFast(BertForSeq2SeqDecoder,GenerationMixin):
+class BertForSeq2SeqDecoderFast(BertForSeq2SeqDecoder,GenerationMixinV2):
     def __init__(self, config, mask_word_id=0, num_labels=2, num_rel=0,
                  search_beam_size=1, length_penalty=1.0, eos_id=0, sos_id=0,
                  forbid_duplicate_ngrams=False, forbid_ignore_set=None, ngram_size=3, min_len=0, mode="s2s",
@@ -260,6 +277,18 @@ class BertForSeq2SeqDecoderFast(BertForSeq2SeqDecoder,GenerationMixin):
         newpast = [pos_ids, token_mask] + reordered_past
         return newpast
 
+    def _reorder_cache_v2(self, past, batch_idx, beam_idx):
+        pos_ids, token_mask, history_states = past[0], past[1], past[2:]
+        reordered_past = []
+        for layer_past in history_states:
+            reordered_past.append(_reorder_buffer_v2(layer_past, batch_idx, beam_idx))
+        pos_ids = pos_ids[beam_idx]
+        token_mask = token_mask[beam_idx]
+        self.dec_mask_token = self.dec_mask_token[beam_idx]
+        self.dec_seg = self.dec_seg[beam_idx]
+        newpast = [pos_ids, token_mask] + reordered_past
+        return newpast
+
     def prepare_inputs_for_generation(self, token_ids, past=None, **kwargs):
         if past is None:
             active_batch_size, _ = token_ids.size()
@@ -278,8 +307,13 @@ class BertForSeq2SeqDecoderFast(BertForSeq2SeqDecoder,GenerationMixin):
             'history_states': history_states
         })
         return ret
+
+    def _use_cache(self, *args, **kwargs):
+        return True
+
     def get_output_embeddings(self):
         return self.cls.predictions.decoder
+
     def beam_search(self, input_ids,token_type_ids,position_ids,attention_mask,task_idx=None,mask_qkv=None):
         #self.src_state = dict({
         #    'src_len': input_ids.size(1),
@@ -292,13 +326,14 @@ class BertForSeq2SeqDecoderFast(BertForSeq2SeqDecoder,GenerationMixin):
         #print(input_ids.size(1))
         #print(attention_mask)
         batch_size = input_ids.size(0)
-        position_ids -= torch.cat((torch.eq(input_ids,torch.ones_like(input_ids)*self.mask_word_id).int(),
-                                   torch.ones([batch_size,position_ids.size(1)-input_ids.size(1)])),-1)
+        position_ids -= torch.cat((torch.eq(input_ids,torch.ones_like(input_ids)*self.mask_word_id).int().cuda(),
+                                   torch.ones([int(batch_size),int(position_ids.size(1)-input_ids.size(1))]).int().cuda()),-1)
         position_ids = torch.cat((position_ids,position_ids[:,-1:]+1),-1)
         attention_mask[:,:,input_ids.size(1)] = torch.zeros_like(attention_mask[:,:,input_ids.size(1)])
         attention_mask = torch.cat((attention_mask,torch.zeros_like(attention_mask[:,:,-1:])),-1)
         attention_mask = torch.cat((attention_mask,attention_mask[:,-1:,:]),1)
         attention_mask[:,-1,-1] = torch.ones_like(attention_mask[:,-1,-1])
+        self.beam_size = self.search_beam_size
         #print(attention_mask.cpu().numpy().tolist())
         #print(position_ids)
         #print(position_ids.size())
@@ -320,7 +355,7 @@ class BertForSeq2SeqDecoderFast(BertForSeq2SeqDecoder,GenerationMixin):
 
         batch_hyp = self.generate(
             bos_token,
-            max_length=self.dec_max_seq_length+1,
+            max_length=self.dec_max_seq_length,
             min_length=self.min_len,
             do_sample=False,
             num_beams=self.search_beam_size,
